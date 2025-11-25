@@ -1221,6 +1221,15 @@ def manejar_mensaje(sender_id, msg):
 
     # ---------------- CATÁLOGO ----------------
     if "catalogo" in msg:
+        # Verificar si el usuario está logueado
+        if estado not in ["logueado", "elige_categoria", "mostrando_producto", "elige_entrega"]:
+            return (
+                "🔐 Para ver el catálogo necesitas iniciar sesión primero.\n\n"
+                "Opciones:\n"
+                "• *Registrar* - Si eres nuevo\n"
+                "• *Iniciar sesion* - Si ya tienes cuenta"
+            )
+        
         if sender_id not in user_state:
             user_state[sender_id] = {"estado": "inicio"}
         return construir_categorias(sender_id)
