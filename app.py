@@ -8,12 +8,8 @@ import string
 from datetime import datetime
 
 # Firebase
-from conexion_firebase import obtener_productos
+from conexion_firebase import obtener_productos, db
 import firebase_admin
-from firebase_admin import firestore
-
-# Cliente Firestore
-db = firestore.client()
 
 # ------------------------------------------------------------
 # CONFIG SERVIDOR
@@ -224,32 +220,40 @@ def finalizar_pedido(sender_id):
     }
 
     # Forma segura: crear doc manualmente y hacer set
-    doc_ref = db.collection("pedidos").document()
-    doc_ref.set(pedido)
-    pedido_id = doc_ref.id
+    try:
+        doc_ref = db.collection("pedidos").document()
+        doc_ref.set(pedido)
+        pedido_id = doc_ref.id
+        
+        # Guardar en estado para el paso de entrega
+        user_state[sender_id]["estado"] = "elige_entrega"
+        user_state[sender_id]["ultimo_pedido_id"] = pedido_id
 
-    # Guardar en estado para el paso de entrega
-    user_state[sender_id]["estado"] = "elige_entrega"
-    user_state[sender_id]["ultimo_pedido_id"] = pedido_id
-
-    msg = (
-        f"🧾 *Pedido registrado*: {pedido_id}\n\n"
-        "📦 ¿Cómo deseas recibirlo?\n"
-        "• *Domicilio*\n"
-        "• *Recoger en tienda*\n\n"
-        "Escribe una opción."
-    )
-    return msg
+        msg = (
+            f"🧾 *Pedido registrado*: {pedido_id}\n\n"
+            "📦 ¿Cómo deseas recibirlo?\n"
+            "• *Domicilio*\n"
+            "• *Recoger en tienda*\n\n"
+            "Escribe una opción."
+        )
+        return msg
+    except Exception as e:
+        print(f"🔥 Error al guardar pedido en Firestore: {type(e).__name__} - {e}")
+        return "❌ Hubo un error al procesar tu pedido. Por favor intenta de nuevo más tarde."
 
 
 # ------------------------------------------------------------
 # CONSULTA DE PEDIDO POR ID
 # ------------------------------------------------------------
 def consultar_pedido_por_id(pid):
-    doc = db.collection("pedidos").document(pid).get()
-    if not doc.exists:
+    try:
+        doc = db.collection("pedidos").document(pid).get()
+        if not doc.exists:
+            return None
+        return doc.to_dict()
+    except Exception as e:
+        print(f"🔥 Error al consultar pedido {pid}: {type(e).__name__} - {e}")
         return None
-    return doc.to_dict()
 
 
 # ------------------------------------------------------------
@@ -330,20 +334,24 @@ def manejar_mensaje(sender_id, msg):
         nombre = user_state[sender_id]["nombre"]
         telefono = user_state[sender_id]["telefono"]
 
-        db.collection("usuarios").document(telefono).set({
-            "nombre": nombre,
-            "telefono": telefono,
-            "direccion": msg
-        })
+        try:
+            db.collection("usuarios").document(telefono).set({
+                "nombre": nombre,
+                "telefono": telefono,
+                "direccion": msg
+            })
 
-        user_state[sender_id]["estado"] = "logueado"
-        user_state[sender_id]["direccion"] = msg
-        user_state[sender_id]["nombre"] = nombre
+            user_state[sender_id]["estado"] = "logueado"
+            user_state[sender_id]["direccion"] = msg
+            user_state[sender_id]["nombre"] = nombre
 
-        return (
-            f"✨ Registro completado, {nombre}.\n\n" +
-            construir_categorias(sender_id)
-        )
+            return (
+                f"✨ Registro completado, {nombre}.\n\n" +
+                construir_categorias(sender_id)
+            )
+        except Exception as e:
+            print(f"🔥 Error al registrar usuario {telefono}: {type(e).__name__} - {e}")
+            return "❌ Hubo un error al completar tu registro. Por favor intenta de nuevo."
 
     # ---------------- LOGIN ----------------
     if msg.startswith("iniciar sesion") or msg == "entrar":
@@ -351,22 +359,26 @@ def manejar_mensaje(sender_id, msg):
         return "🔐 Escribe tu número telefónico registrado."
 
     if estado == "login":
-        doc = db.collection("usuarios").document(msg).get()
-        if not doc.exists:
-            return "❌ Ese número no está registrado. Escribe *registrar* para crear cuenta."
-        data = doc.to_dict()
+        try:
+            doc = db.collection("usuarios").document(msg).get()
+            if not doc.exists:
+                return "❌ Ese número no está registrado. Escribe *registrar* para crear cuenta."
+            data = doc.to_dict()
 
-        user_state[sender_id] = {
-            "estado": "logueado",
-            "nombre": data.get("nombre"),
-            "telefono": msg,
-            "direccion": data.get("direccion")
-        }
+            user_state[sender_id] = {
+                "estado": "logueado",
+                "nombre": data.get("nombre"),
+                "telefono": msg,
+                "direccion": data.get("direccion")
+            }
 
-        return (
-            f"✨ Bienvenido de nuevo, {data.get('nombre')}.\n\n" +
-            construir_categorias(sender_id)
-        )
+            return (
+                f"✨ Bienvenido de nuevo, {data.get('nombre')}.\n\n" +
+                construir_categorias(sender_id)
+            )
+        except Exception as e:
+            print(f"🔥 Error al hacer login con {msg}: {type(e).__name__} - {e}")
+            return "❌ Hubo un error al iniciar sesión. Por favor intenta de nuevo."
 
     # ---------------- CONSULTAR PEDIDO POR ID ----------------
     if msg.startswith("ver pedido") or msg.startswith("consultar") or msg.startswith("estado pedido"):
@@ -492,25 +504,33 @@ def manejar_mensaje(sender_id, msg):
         pid = user_state[sender_id].get("ultimo_pedido_id")
 
         if any(x in msg for x in ["domicilio", "casa", "enviar"]):
-            db.collection("pedidos").document(pid).update({
-                "entrega": "domicilio",
-                "direccion": user_state[sender_id].get("direccion", "No registrada")
-            })
-            user_state[sender_id]["estado"] = "logueado"
-            return (
-                f"🚚 Tu pedido será enviado a tu domicilio.\n"
-                f"🧾 ID del pedido: {pid}"
-            )
+            try:
+                db.collection("pedidos").document(pid).update({
+                    "entrega": "domicilio",
+                    "direccion": user_state[sender_id].get("direccion", "No registrada")
+                })
+                user_state[sender_id]["estado"] = "logueado"
+                return (
+                    f"🚚 Tu pedido será enviado a tu domicilio.\n"
+                    f"🧾 ID del pedido: {pid}"
+                )
+            except Exception as e:
+                print(f"🔥 Error al actualizar entrega a domicilio: {type(e).__name__} - {e}")
+                return "❌ Hubo un error al procesar tu método de entrega. Por favor contacta con soporte."
 
         if any(x in msg for x in ["recoger", "tienda", "pick"]):
-            db.collection("pedidos").document(pid).update({
-                "entrega": "tienda"
-            })
-            user_state[sender_id]["estado"] = "logueado"
-            return (
-                f"🏬 Puedes recoger tu pedido en la tienda.\n"
-                f"🧾 ID del pedido: {pid}"
-            )
+            try:
+                db.collection("pedidos").document(pid).update({
+                    "entrega": "tienda"
+                })
+                user_state[sender_id]["estado"] = "logueado"
+                return (
+                    f"🏬 Puedes recoger tu pedido en la tienda.\n"
+                    f"🧾 ID del pedido: {pid}"
+                )
+            except Exception as e:
+                print(f"🔥 Error al actualizar entrega en tienda: {type(e).__name__} - {e}")
+                return "❌ Hubo un error al procesar tu método de entrega. Por favor contacta con soporte."
 
         return "❌ Escribe *domicilio* o *recoger en tienda*."
 
