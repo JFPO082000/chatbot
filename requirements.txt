@@ -4,3 +4,4 @@ firebase-admin==6.5.0
 google-generativeai==0.8.3
 gunicorn==23.0.0
 google-cloud-dialogflow==2.27.0
+huggingface_hub>=0.23.0
