@@ -6,7 +6,8 @@ import os
 import unicodedata
 import string
 from datetime import datetime, timedelta
-
+from datetime import datetime, timedelta
+from huggingface_hub import InferenceClient
 # Firebase
 from conexion_firebase import obtener_productos, db
 import firebase_admin
