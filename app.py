@@ -4,6 +4,7 @@ import logging
 import os
 import unicodedata
 import string
+import urllib.parse  # ✅ IMPORTANTE: Para codificar el nombre en la URL de la imagen
 from datetime import datetime, timedelta
 
 # Importamos la librería de Hugging Face para la IA
@@ -70,6 +71,23 @@ def verificar_rate_limit(sender_id):
 def sanitizar_input(texto):
     if not texto: return ""
     return texto[:500].replace('<', '').replace('>', '').strip()
+
+# ✅ NUEVA FUNCIÓN: GENERADOR DE IMÁGENES AUTOMÁTICO
+def get_img_url(datos):
+    """
+    Si el producto tiene URL en Firebase, la usa.
+    Si no, genera una imagen automática con el nombre del producto.
+    """
+    url = datos.get("imagen_url", "")
+    # Si existe y parece un link válido, úsalo
+    if url and url.startswith("http") and len(url) > 10:
+        return url
+    
+    # Si no, crea un placeholder
+    nombre = datos.get("nombre", "Producto")
+    # Limpiamos el nombre para que funcione en la URL (ej: "Tenis Nike" -> "Tenis+Nike")
+    nombre_safe = urllib.parse.quote_plus(nombre)
+    return f"https://placehold.co/300x300?text={nombre_safe}"
 
 # ------------------------------------------------------------
 # COMUNICACIÓN CON FACEBOOK
@@ -163,16 +181,17 @@ def reducir_stock(pid, cantidad):
     except: return False
 
 # ------------------------------------------------------------
-# CONSULTAS DE PRODUCTOS
+# CONSULTAS DE PRODUCTOS (CON FOTOS AUTOMÁTICAS)
 # ------------------------------------------------------------
 def productos_nuevos(dias=30):
     prods = obtener_productos_con_cache()
     res = []
     hoy = datetime.now()
     for pid, d in prods.items():
-        # Lógica simple: tomamos los últimos agregados si no hay fecha
         if len(res) < 5: 
             d['id'] = pid
+            # ✅ Aseguramos imagen
+            d['imagen_url'] = get_img_url(d)
             res.append(d)
     return res
 
@@ -182,6 +201,8 @@ def productos_en_oferta():
     for pid, d in prods.items():
         if d.get('oferta'):
             d['id'] = pid
+            # ✅ Aseguramos imagen
+            d['imagen_url'] = get_img_url(d)
             res.append(d)
     return res
 
@@ -192,6 +213,8 @@ def buscar_producto(termino):
     for pid, d in prods.items():
         if t in normalizar(d.get('nombre', '')):
             d['id'] = pid
+            # ✅ Aseguramos imagen
+            d['imagen_url'] = get_img_url(d)
             res.append(d)
     return res
 
@@ -199,7 +222,12 @@ def verificar_stock(pid):
     prods = obtener_productos_con_cache()
     if pid in prods:
         d = prods[pid]
-        return {"nombre": d.get("nombre"), "stock": d.get("stock", 0), "imagen_url": d.get("imagen_url"), "disponible": d.get("stock", 0) > 0}
+        return {
+            "nombre": d.get("nombre"), 
+            "stock": d.get("stock", 0), 
+            "imagen_url": get_img_url(d), # ✅ Aseguramos imagen
+            "disponible": d.get("stock", 0) > 0
+        }
     return None
 
 def mi_ultimo_pedido(telefono):
@@ -393,7 +421,9 @@ def manejar_mensaje(sender_id, msg):
         
         if not prods: return "Vacío."
         p = prods[0]
-        enviar_imagen(sender_id, p.get("imagen_url"))
+        # ✅ AQUÍ TAMBIÉN GENERAMOS IMAGEN SI FALTA
+        url_img = get_img_url(p)
+        enviar_imagen(sender_id, url_img)
         return f"🔹 {p['nombre']}\n💲 ${p['precio']}\n\nEscribe *si* para agregar, o *no* para siguiente."
 
     if estado == "viendo_cat":
@@ -405,7 +435,9 @@ def manejar_mensaje(sender_id, msg):
                 return "Fin de categoría. Escribe *finalizar* o *catalogo*."
             user_state[sender_id]["idx"] = idx
             p = prods[idx]
-            enviar_imagen(sender_id, p.get("imagen_url"))
+            # ✅ AQUÍ TAMBIÉN
+            url_img = get_img_url(p)
+            enviar_imagen(sender_id, url_img)
             return f"🔹 {p['nombre']}\n💲 ${p['precio']}\n\n¿Lo quieres?"
         
         if msg in ["si", "lo quiero"]:
