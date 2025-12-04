@@ -951,7 +951,68 @@ def receive_message():
 
     return "OK", 200
 
+# ------------------------------------------------------------
+# INTELIGENCIA ARTIFICIAL (HUGGING FACE)
+# ------------------------------------------------------------
+def consultar_ia_qwen(sender_id, mensaje_usuario):
+    """
+    Usa Qwen 2.5 para responder dudas generales usando los productos de la tienda.
+    """
+    token_hf = os.environ.get("HF_TOKEN")
+    if not token_hf:
+        return "⚠️ Error: No está configurado el token de IA en el servidor."
 
+    # 1. Obtenemos el inventario actual (usando tu caché para no gastar Firebase)
+    try:
+        productos_dict = obtener_productos_con_cache()
+        texto_inventario = ""
+        
+        # Resumimos los productos para que la IA los entienda rápido
+        count = 0
+        for pid, datos in productos_dict.items():
+            if count > 20: break # Limitamos a 20 productos para no saturar a la IA
+            nombre = datos.get("nombre", "Producto")
+            precio = datos.get("precio", 0)
+            stock = datos.get("stock", 0)
+            texto_inventario += f"- {nombre}: ${precio} (ID: {pid}) Stock: {stock}\n"
+            count += 1
+            
+    except Exception as e:
+        texto_inventario = "No se pudo cargar el inventario."
+
+    # 2. Preparamos el Prompt (Instrucciones)
+    prompt_sistema = f"""
+    Eres 'Frere's Bot', un asistente virtual amable y breve de una tienda.
+    
+    INVENTARIO ACTUAL:
+    {texto_inventario}
+    
+    INSTRUCCIONES:
+    1. Responde la duda del usuario basándote en el inventario.
+    2. Si preguntan precios, dálos exactos.
+    3. Si el usuario quiere comprar, dile que escriba: "pedido ID_DEL_PRODUCTO".
+    4. Sé muy breve (máximo 2 frases).
+    5. Si no sabes la respuesta, di que contacten a soporte humano.
+    """
+
+    # 3. Conectamos con Hugging Face
+    try:
+        client = InferenceClient(token=token_hf)
+        mensajes = [
+            {"role": "system", "content": prompt_sistema},
+            {"role": "user", "content": mensaje_usuario}
+        ]
+        
+        respuesta = client.chat_completion(
+            messages=mensajes,
+            model="Qwen/Qwen2.5-7B-Instruct",
+            max_tokens=150,
+            temperature=0.5
+        )
+        return respuesta.choices[0].message.content
+    except Exception as e:
+        print(f"🔥 Error IA: {e}")
+        return "Lo siento, mi cerebro digital está descansando. Intenta preguntar de otra forma."
 # ------------------------------------------------------------
 # LÓGICA PRINCIPAL DEL BOT
 # ------------------------------------------------------------
@@ -1332,11 +1393,12 @@ def manejar_mensaje(sender_id, msg):
             user_state[sender_id]["indice_producto"] += 1
             return confirm + "\n\n" + mostrar_producto(sender_id)
 
-        return (
-            "🤔 No entendí.\n"
-            "Escribe *si*, *sí*, *pedido ID*, el *ID*,\n"
-            "*2x ID* para cantidad, o *no* para avanzar."
-        )
+        # ---------------- FALLBACK (INTELIGENCIA ARTIFICIAL) ----------------
+    # Si el mensaje no fue ningún comando (hola, catalogo, pedido, etc.),
+    # se lo enviamos a la IA para que intente responder.
+    
+    # Enviamos un aviso de "escribiendo..." o esperamos un poco (opcional)
+    return consultar_ia_qwen(sender_id, msg)
 
     # ---------------- ELECCIÓN MÉTODO DE ENTREGA ----------------
     if estado == "elige_entrega":
