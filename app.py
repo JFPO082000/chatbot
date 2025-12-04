@@ -1,4 +1,3 @@
-
 from flask import Flask, request
 import requests
 import logging
@@ -6,8 +5,10 @@ import os
 import unicodedata
 import string
 from datetime import datetime, timedelta
-from datetime import datetime, timedelta
+
+# Importamos la librería de Hugging Face para la IA
 from huggingface_hub import InferenceClient
+
 # Firebase
 from conexion_firebase import obtener_productos, db
 import firebase_admin
@@ -211,7 +212,10 @@ def obtener_productos_con_cache():
     
     # Caché inválido o expirado, obtener de Firebase
     print("🔄 Actualizando caché de productos desde Firebase")
-    productos = obtener_productos_con_cache()
+    
+    # --- CORRECCIÓN CRÍTICA: Llamar a la función importada, no a sí misma ---
+    productos = obtener_productos() 
+    # -------------------------------------------------------------------------
     
     # Actualizar caché
     productos_cache["data"] = productos
@@ -900,58 +904,6 @@ def consultar_pedido_por_id(pid):
 
 
 # ------------------------------------------------------------
-# WEBHOOK (VERIFICACIÓN)
-# ------------------------------------------------------------
-@app.route("/webhook", methods=["GET"])
-def verify_webhook():
-    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-        return request.args.get("hub.challenge")
-    return "Token inválido", 403
-
-
-# ------------------------------------------------------------
-# WEBHOOK (MENSAJES)
-# ------------------------------------------------------------
-@app.route("/webhook", methods=["POST"])
-def receive_message():
-    data = request.get_json()
-
-    for entry in data.get("entry", []):
-        for event in entry.get("messaging", []):
-            if "message" in event and not event["message"].get("is_echo"):
-                sender_id = event["sender"]["id"]
-                texto = event["message"].get("text", "")
-                
-                # Verificar rate limiting
-                if not verificar_rate_limit(sender_id):
-                    enviar_mensaje(sender_id, "⏱️ Por favor espera un momento antes de enviar más mensajes.")
-                    continue
-                
-                # Sanitizar input
-                texto = sanitizar_input(texto)
-                msg_norm = normalizar(texto)
-                
-                # Registrar mensaje en analytics
-                registrar_mensaje(sender_id, msg_norm, "recibido")
-
-                # Cargar sesión desde Firestore si no está en memoria
-                if sender_id not in user_state:
-                    sesion_guardada = cargar_sesion(sender_id)
-                    if sesion_guardada:
-                        user_state[sender_id] = sesion_guardada
-                        print(f"📂 Sesión cargada para {sender_id}")
-
-                resp = manejar_mensaje(sender_id, msg_norm)
-                if resp:
-                    enviar_mensaje(sender_id, resp)
-                    registrar_mensaje(sender_id, resp, "enviado")
-                
-                # Guardar sesión después de procesar mensaje
-                guardar_sesion(sender_id)
-
-    return "OK", 200
-
-# ------------------------------------------------------------
 # INTELIGENCIA ARTIFICIAL (HUGGING FACE)
 # ------------------------------------------------------------
 def consultar_ia_qwen(sender_id, mensaje_usuario):
@@ -1003,6 +955,7 @@ def consultar_ia_qwen(sender_id, mensaje_usuario):
             {"role": "user", "content": mensaje_usuario}
         ]
         
+        # Usamos Qwen 2.5 que es gratuito y eficiente
         respuesta = client.chat_completion(
             messages=mensajes,
             model="Qwen/Qwen2.5-7B-Instruct",
@@ -1013,6 +966,61 @@ def consultar_ia_qwen(sender_id, mensaje_usuario):
     except Exception as e:
         print(f"🔥 Error IA: {e}")
         return "Lo siento, mi cerebro digital está descansando. Intenta preguntar de otra forma."
+
+
+# ------------------------------------------------------------
+# WEBHOOK (VERIFICACIÓN)
+# ------------------------------------------------------------
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    return "Token inválido", 403
+
+
+# ------------------------------------------------------------
+# WEBHOOK (MENSAJES)
+# ------------------------------------------------------------
+@app.route("/webhook", methods=["POST"])
+def receive_message():
+    data = request.get_json()
+
+    for entry in data.get("entry", []):
+        for event in entry.get("messaging", []):
+            if "message" in event and not event["message"].get("is_echo"):
+                sender_id = event["sender"]["id"]
+                texto = event["message"].get("text", "")
+                
+                # Verificar rate limiting
+                if not verificar_rate_limit(sender_id):
+                    enviar_mensaje(sender_id, "⏱️ Por favor espera un momento antes de enviar más mensajes.")
+                    continue
+                
+                # Sanitizar input
+                texto = sanitizar_input(texto)
+                msg_norm = normalizar(texto)
+                
+                # Registrar mensaje en analytics
+                registrar_mensaje(sender_id, msg_norm, "recibido")
+
+                # Cargar sesión desde Firestore si no está en memoria
+                if sender_id not in user_state:
+                    sesion_guardada = cargar_sesion(sender_id)
+                    if sesion_guardada:
+                        user_state[sender_id] = sesion_guardada
+                        print(f"📂 Sesión cargada para {sender_id}")
+
+                resp = manejar_mensaje(sender_id, msg_norm)
+                if resp:
+                    enviar_mensaje(sender_id, resp)
+                    registrar_mensaje(sender_id, resp, "enviado")
+                
+                # Guardar sesión después de procesar mensaje
+                guardar_sesion(sender_id)
+
+    return "OK", 200
+
+
 # ------------------------------------------------------------
 # LÓGICA PRINCIPAL DEL BOT
 # ------------------------------------------------------------
@@ -1064,7 +1072,7 @@ def manejar_mensaje(sender_id, msg):
         if not ofertas:
             return "😕 No hay ofertas activas en este momento. Escribe *catalogo* para ver todos los productos."
         
-        msg_resp = f"� *Productos en oferta:*\n\n"
+        msg_resp = f"🔥 *Productos en oferta:*\n\n"
         for i, p in enumerate(ofertas[:10], 1):  # Máximo 10
             if p['descuento'] > 0:
                 msg_resp += f"{i}. {p['nombre']}\n💵 Antes: ${p['precio_original']} MXN\n🔥 Ahora: ${p['precio_final']:.2f} MXN ({p['descuento']}% OFF)\n🆔 ID: {p['id']}\n\n"
@@ -1088,12 +1096,12 @@ def manejar_mensaje(sender_id, msg):
         registrar_busqueda(sender_id, termino, len(resultados))
         
         if not resultados:
-            return f"� No encontré productos con '{termino}'. Escribe *catalogo* para ver todos los productos."
+            return f"😕 No encontré productos con '{termino}'. Escribe *catalogo* para ver todos los productos."
         
         msg_resp = f"🔍 Encontré {len(resultados)} producto(s) con '{termino}':\n\n"
         for i, p in enumerate(resultados[:8], 1):  # Máximo 8
             stock_txt = "✅ Disponible" if p['stock'] > 0 else "❌ Agotado"
-            msg_resp += f"{i}. {p['nombre']}\n💰 ${p['precio']} MXN\n� {stock_txt}\n🆔 ID: {p['id']}\n\n"
+            msg_resp += f"{i}. {p['nombre']}\n💰 ${p['precio']} MXN\n📦 {stock_txt}\n🆔 ID: {p['id']}\n\n"
         
         msg_resp += "Para agregar al pedido escribe: *si ID* o *pedido ID*"
         return msg_resp
@@ -1124,7 +1132,7 @@ def manejar_mensaje(sender_id, msg):
             return "💵 Escribe:\n• *menos de 500*\n• *mas de 200*\n• *entre 100 y 500*"
         
         if not resultados:
-            return f"� No encontré productos en ese rango de precio."
+            return f"😕 No encontré productos en ese rango de precio."
         
         msg_resp = f"💵 *{titulo}:*\n\n"
         for i, p in enumerate(resultados[:10], 1):  # Máximo 10
@@ -1149,7 +1157,7 @@ def manejar_mensaje(sender_id, msg):
             return f"❌ No encontré el producto con ID {producto_id}."
         
         if info['disponible']:
-            return f"✅ *{info['nombre']}*\n� Stock disponible: {info['stock']} unidades\n🆔 ID: {info['id']}"
+            return f"✅ *{info['nombre']}*\n📦 Stock disponible: {info['stock']} unidades\n🆔 ID: {info['id']}"
         else:
             return f"❌ *{info['nombre']}*\n😕 Producto agotado\n🆔 ID: {info['id']}"
 
@@ -1163,7 +1171,7 @@ def manejar_mensaje(sender_id, msg):
         pedido = mi_ultimo_pedido(telefono)
         
         if not pedido:
-            return "� No tienes pedidos registrados aún."
+            return "😕 No tienes pedidos registrados aún."
         
         msg_resp = f"📦 *Tu último pedido:*\n\n"
         msg_resp += f"🆔 ID: {pedido['id']}\n"
@@ -1393,12 +1401,11 @@ def manejar_mensaje(sender_id, msg):
             user_state[sender_id]["indice_producto"] += 1
             return confirm + "\n\n" + mostrar_producto(sender_id)
 
-        # ---------------- FALLBACK (INTELIGENCIA ARTIFICIAL) ----------------
-    # Si el mensaje no fue ningún comando (hola, catalogo, pedido, etc.),
-    # se lo enviamos a la IA para que intente responder.
-    
-    # Enviamos un aviso de "escribiendo..." o esperamos un poco (opcional)
-    return consultar_ia_qwen(sender_id, msg)
+        return (
+            "🤔 No entendí.\n"
+            "Escribe *si*, *sí*, *pedido ID*, el *ID*,\n"
+            "*2x ID* para cantidad, o *no* para avanzar."
+        )
 
     # ---------------- ELECCIÓN MÉTODO DE ENTREGA ----------------
     if estado == "elige_entrega":
@@ -1435,16 +1442,12 @@ def manejar_mensaje(sender_id, msg):
 
         return "❌ Escribe *domicilio* o *recoger en tienda*."
 
-    # ---------------- FALLBACK ----------------
-    return (
-        "🤔 No entendí.\n\n"
-        "Puedo ayudarte con:\n"
-        "🛍 Catalogo\n"
-        "📝 Registrar\n"
-        "🔐 Iniciar sesion\n"
-        "🕒 Horario\n"
-        "📞 Contacto"
-    )
+    # ---------------- FALLBACK (INTELIGENCIA ARTIFICIAL) ----------------
+    # Si el mensaje no fue ningún comando (hola, catalogo, pedido, etc.),
+    # se lo enviamos a la IA para que intente responder.
+    
+    # Enviamos un aviso de "escribiendo..." o esperamos un poco (opcional)
+    return consultar_ia_qwen(sender_id, msg)
 
 
 # ------------------------------------------------------------
