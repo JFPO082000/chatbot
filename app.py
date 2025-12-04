@@ -1,429 +1,529 @@
-import streamlit as st
-import firebase_admin
-from firebase_admin import credentials, firestore
-import pandas as pd
-import os
-import sys
+from flask import Flask, request
+import requests
 import logging
-import warnings
+import os
+import unicodedata
+import string
+import urllib.parse
+from datetime import datetime, timedelta
+
+# Librería para la IA
 from huggingface_hub import InferenceClient
 
+# Firebase - Importamos funciones de tus otros archivos
+from conexion_firebase import obtener_productos, db
+import firebase_admin
+from firebase_admin import firestore
+
 # ==========================================
-# 0. AUTO-ARRANQUE (MAGIC BOOTSTRAP)
+# 1. CONFIGURACIÓN DEL SERVIDOR
 # ==========================================
-if __name__ == "__main__":
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Variables de Entorno (Configuradas en Render)
+VERIFY_TOKEN = "freres_verificacion"
+PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+if not PAGE_ACCESS_TOKEN:
+    print("❌ ERROR: Faltan credenciales de Facebook en Render.")
+
+# Memoria Caché (RAM)
+user_state = {}
+productos_cache = {
+    "data": None,
+    "timestamp": None,
+    "ttl": 300  # 5 minutos
+}
+
+# Límites de Seguridad
+SESSION_TIMEOUT = 1800 
+RATE_LIMIT_MESSAGES = 10
+RATE_LIMIT_WINDOW = 60
+user_message_count = {} 
+
+# ==========================================
+# 2. HERRAMIENTAS Y UTILIDADES
+# ==========================================
+def normalizar(t):
+    if not t: return ""
+    t = t.lower().strip()
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return t.translate(str.maketrans("", "", string.punctuation))
+
+def verificar_rate_limit(sender_id):
+    global user_message_count
+    ahora = datetime.now()
+    if sender_id not in user_message_count: user_message_count[sender_id] = []
+    user_message_count[sender_id] = [ts for ts in user_message_count[sender_id] if (ahora - ts).total_seconds() < RATE_LIMIT_WINDOW]
+    if len(user_message_count[sender_id]) >= RATE_LIMIT_MESSAGES: return False
+    user_message_count[sender_id].append(ahora)
+    return True
+
+def sanitizar_input(texto):
+    if not texto: return ""
+    return texto[:500].replace('<', '').replace('>', '').strip()
+
+# --- GENERADOR DE IMÁGENES AUTOMÁTICO ---
+def get_img_url(datos):
+    """Devuelve la URL de Firebase o genera una si no existe."""
+    url = datos.get("imagen_url", "")
+    # Si es un link real (http...), lo usamos
+    if url and url.startswith("http") and len(url) > 10:
+        return url
+    
+    # Si no, generamos una imagen con el nombre
+    nombre_safe = urllib.parse.quote_plus(datos.get("nombre", "Producto"))
+    return f"https://placehold.co/300x300?text={nombre_safe}"
+
+# ==========================================
+# 3. COMUNICACIÓN CON FACEBOOK
+# ==========================================
+def enviar_mensaje(id_usuario, texto):
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
     try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        if not get_script_run_ctx():
-            from streamlit.web import cli as stcli
-            sys.argv = ["streamlit", "run", sys.argv[0]]
-            sys.exit(stcli.main())
-    except ImportError:
-        pass 
-
-# ==========================================
-# 1. CONFIGURACIÓN RÁPIDA
-# ==========================================
-# ⚠️ PEGA TU TOKEN AQUÍ
-HF_TOKEN = "PEGAR_TU_TOKEN_AQUI" 
-
-os.environ["STREAMLIT_LOG_LEVEL"] = "error"
-logging.getLogger("streamlit").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore")
-
-try:
-    st.set_page_config(
-        page_title="Admin Frere's Collection", 
-        layout="wide",
-        page_icon="🛍️"
-    )
-except:
-    pass
-
-st.markdown("""
-    <style>
-    .stButton>button { width: 100%; }
-    .reportview-container { margin-top: -2em; }
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    .img-container { border-radius: 10px; overflow: hidden; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# ==========================================
-# 2. CONEXIÓN A FIREBASE
-# ==========================================
-ARCHIVO_CREDENCIALES = "credenciales.json"
-
-@st.cache_resource
-def conectar_firebase():
-    try:
-        if firebase_admin._apps:
-            return firestore.client()
-        if os.path.exists(ARCHIVO_CREDENCIALES):
-            cred = credentials.Certificate(ARCHIVO_CREDENCIALES)
-            firebase_admin.initialize_app(cred)
-            return firestore.client()
-        else:
-            st.error(f"⚠️ No encuentro '{ARCHIVO_CREDENCIALES}'")
-            return None
+        requests.post(url, json={"recipient": {"id": id_usuario}, "message": {"text": texto}})
     except Exception as e:
-        st.error(f"Error de conexión: {e}")
+        print(f"Error enviando mensaje: {e}")
+
+def enviar_imagen(id_usuario, url_img):
+    if not url_img: return
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": id_usuario},
+        "message": {
+            "attachment": {
+                "type": "image",
+                "payload": {"url": url_img, "is_reusable": True}
+            }
+        }
+    }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Error enviando imagen: {e}")
+
+# ==========================================
+# 4. GESTIÓN DE DATOS (FIREBASE)
+# ==========================================
+def cargar_sesion(sender_id):
+    try:
+        doc = db.collection("sesiones").document(sender_id).get()
+        return doc.to_dict() if doc.exists else None
+    except: return None
+
+def guardar_sesion(sender_id):
+    try:
+        estado = user_state.get(sender_id)
+        if estado:
+            estado["ultima_actividad"] = datetime.now()
+            db.collection("sesiones").document(sender_id).set(estado)
+    except: pass
+
+def obtener_productos_con_cache():
+    global productos_cache
+    ahora = datetime.now()
+    if productos_cache["data"] and productos_cache["timestamp"]:
+        if (ahora - productos_cache["timestamp"]).total_seconds() < productos_cache["ttl"]:
+            return productos_cache["data"]
+    
+    # Llamada real a Firebase
+    productos = obtener_productos()
+    productos_cache["data"] = productos
+    productos_cache["timestamp"] = ahora
+    return productos
+
+def reducir_stock(pid, cantidad):
+    try:
+        ref = db.collection("productos").document(pid)
+        doc = ref.get()
+        if not doc.exists: return False
+        stock = int(doc.to_dict().get("stock", 0))
+        if stock < cantidad: return False
+        ref.update({"stock": stock - cantidad})
+        productos_cache["data"] = None # Invalidar caché para refrescar
+        return True
+    except: return False
+
+def registrar_conversion(sender_id, pedido_id, total):
+    try:
+        db.collection("analytics").add({
+            "tipo": "conversion", "sender_id": sender_id, 
+            "pedido_id": pedido_id, "total": total, "timestamp": datetime.now()
+        })
+    except: pass
+
+# ==========================================
+# 5. LÓGICA DE NEGOCIO (BUSCADOR)
+# ==========================================
+def buscar_productos_clave(termino):
+    prods = obtener_productos_con_cache()
+    resultados = []
+    t = normalizar(termino)
+    for pid, d in prods.items():
+        nombre = normalizar(d.get("nombre", ""))
+        cat = normalizar(d.get("categoria", ""))
+        # Búsqueda flexible
+        if t in nombre or t in cat:
+            d['id'] = pid
+            d['imagen_url'] = get_img_url(d) # Aseguramos imagen
+            resultados.append(d)
+    return resultados
+
+def verificar_stock(pid):
+    prods = obtener_productos_con_cache()
+    if pid in prods:
+        d = prods[pid]
+        return {
+            "nombre": d.get("nombre"),
+            "stock": d.get("stock", 0),
+            "imagen_url": get_img_url(d),
+            "disponible": int(d.get("stock", 0)) > 0
+        }
+    return None
+
+def mi_ultimo_pedido(telefono):
+    try:
+        docs = db.collection("pedidos").where("telefono", "==", telefono)\
+                 .order_by("fecha", direction=firestore.Query.DESCENDING).limit(1).stream()
+        for d in docs:
+            ped = d.to_dict()
+            ped['id'] = d.id
+            return ped
+    except: return None
+
+# ==========================================
+# 6. INTELIGENCIA ARTIFICIAL (QWEN)
+# ==========================================
+def consultar_ia(sender_id, mensaje):
+    if not HF_TOKEN: return "⚠️ IA desactivada (Falta Token)."
+    
+    try:
+        # 1. Obtener datos y filtrar (Smart RAG)
+        prods = obtener_productos_con_cache()
+        palabras = mensaje.lower().split()
+        
+        relevantes = []
+        otros = []
+        
+        for pid, p in prods.items():
+            texto_prod = (str(p.get("nombre")) + " " + str(p.get("categoria"))).lower()
+            info = f"- {p.get('nombre')} (ID: {pid}) | ${p.get('precio')} | Stock: {p.get('stock')}"
+            
+            # Si el producto coincide con lo que el usuario escribió
+            match = any(word in texto_prod for word in palabras if len(word) > 3)
+            if match: relevantes.append(info)
+            else: otros.append(info)
+        
+        # Priorizamos los productos relevantes en el contexto
+        lista_contexto = relevantes[:15] + otros[:5]
+        contexto_str = "\n".join(lista_contexto)
+        
+        # 2. Prompt del Sistema (Anti-Chino y Vendedor)
+        prompt = f"""
+        [DIRECTIVA] Eres 'Frere's Bot', un vendedor experto.
+        [IDIOMA] Responde SIEMPRE en ESPAÑOL (MÉXICO). Nunca uses otro idioma.
+        [DATOS] Usa este inventario real:
+        {contexto_str}
+        
+        [REGLAS]
+        - Si preguntan precio/stock, dalo exacto.
+        - Si no encuentras el producto en la lista de arriba, di amablemente que no lo tienes.
+        - Sé breve y usa emojis.
+        - Para vender: "Escribe 'pedido ID'".
+        """
+        
+        client = InferenceClient(token=HF_TOKEN)
+        resp = client.chat_completion(
+            messages=[{"role":"system","content":prompt}, {"role":"user","content":mensaje}],
+            model="Qwen/Qwen2.5-7B-Instruct",
+            max_tokens=200, 
+            temperature=0.3
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        print(f"Error IA: {e}")
+        return "Dame un segundo, estoy revisando el almacén..."
+
+# ==========================================
+# 7. CEREBRO DEL BOT (Manejo de Mensajes)
+# ==========================================
+def manejar_mensaje(sender_id, msg):
+    estado = user_state.get(sender_id, {}).get("estado", "inicio")
+
+    # --- COMANDOS GENERALES ---
+    if any(x in msg for x in ["hola", "inicio", "menu"]):
+        return "👋 ¡Hola! Soy Frere's Bot.\n\nEscribe:\n🛍 *Catalogo*\n🔍 *Buscar (producto)*\n🆕 *Novedades*\n📦 *Mi Pedido*"
+
+    if "contacto" in msg: return "📞 WhatsApp: 55-1234-5678"
+    
+    # --- NOVEDADES / OFERTAS ---
+    if any(x in msg for x in ["nuevo", "novedad", "oferta"]):
+        es_oferta = "oferta" in msg
+        prods = obtener_productos_con_cache()
+        items = []
+        
+        for pid, d in prods.items():
+            if (es_oferta and d.get('oferta')) or (not es_oferta):
+                d['id'] = pid
+                d['imagen_url'] = get_img_url(d)
+                items.append(d)
+            if len(items) >= 5: break
+        
+        if not items: return "No encontré productos en esta sección."
+        
+        txt = "🔥 *Ofertas:*\n" if es_oferta else "🆕 *Novedades:*\n"
+        imgs = []
+        for i, p in enumerate(items):
+            txt += f"🔹 {p['nombre']} (${p['precio']}) - ID: {p['id']}\n"
+            if i < 3: imgs.append(p['imagen_url'])
+            
+        enviar_mensaje(sender_id, txt) # Texto PRIMERO
+        for img in imgs: enviar_imagen(sender_id, img) # Imágenes DESPUÉS
         return None
 
-db = conectar_firebase()
-
-# ==========================================
-# 3. FUNCIONES DE DATOS
-# ==========================================
-
-@st.cache_data(ttl=300) 
-def obtener_todos_productos():
-    if not db: return []
-    try:
-        docs = db.collection("productos").stream()
-        return [{**doc.to_dict(), 'id_firebase': doc.id} for doc in docs]
-    except: return []
-
-@st.cache_data(ttl=300)
-def obtener_usuarios():
-    if not db: return []
-    try:
-        docs = db.collection("usuarios").stream()
-        return [{**doc.to_dict(), 'id_firebase': doc.id} for doc in docs]
-    except: return []
-
-@st.cache_data(ttl=300)
-def obtener_pedidos():
-    if not db: return []
-    try:
-        docs = db.collection("pedidos").order_by("fecha", direction=firestore.Query.DESCENDING).stream()
-        return [{**doc.to_dict(), 'id_firebase': doc.id} for doc in docs]
-    except:
-        try:
-            docs = db.collection("pedidos").stream()
-            return [{**doc.to_dict(), 'id_firebase': doc.id} for doc in docs]
-        except: return []
-
-def guardar_producto(datos, doc_id=None):
-    if not db: return
-    col = db.collection("productos")
-    if doc_id: col.document(str(doc_id)).set(datos)
-    else: col.add(datos)
-    obtener_todos_productos.clear()
-
-def eliminar_producto(doc_id):
-    if not db: return
-    db.collection("productos").document(doc_id).delete()
-    obtener_todos_productos.clear()
-
-def guardar_usuario(datos, doc_id):
-    if not db: return
-    db.collection("usuarios").document(str(doc_id)).set(datos)
-    obtener_usuarios.clear()
-
-def eliminar_usuario(doc_id):
-    if not db: return
-    db.collection("usuarios").document(doc_id).delete()
-    obtener_usuarios.clear()
-
-def actualizar_estado_pedido(doc_id, nuevo_estado):
-    if not db: return
-    db.collection("pedidos").document(doc_id).update({"estado": nuevo_estado})
-    obtener_pedidos.clear()
-
-def eliminar_pedido(doc_id):
-    if not db: return
-    db.collection("pedidos").document(doc_id).delete()
-    obtener_pedidos.clear()
-
-# --- FUNCIÓN AUXILIAR: IMAGEN SEGURA ---
-def mostrar_imagen_segura(url):
-    placeholder = "https://placehold.co/400x300?text=Sin+Imagen"
-    if not url or not isinstance(url, str) or len(url) < 5:
-        st.image(placeholder, use_container_width=True)
-        return
-    try:
-        st.image(url, use_container_width=True)
-    except Exception:
-        st.image("https://placehold.co/400x300?text=Error+URL", use_container_width=True)
-
-# --- FUNCIÓN AUXILIAR: DESCARGAR CSV ---
-def convertir_df(df):
-    return df.to_csv(index=False).encode('utf-8')
-
-# ==========================================
-# 4. INTERFAZ GRÁFICA
-# ==========================================
-
-if db:
-    with st.sidebar:
-        st.title("🛍️ Panel Admin")
-        st.write("---")
-        opcion = st.radio("Menú", ["Vista General", "Agregar Producto", "Editar / Borrar", "Usuarios", "Pedidos", "Asistente IA"])
-        st.write("---")
-        if st.button("🔄 Recargar Datos"):
-            st.cache_data.clear()
-            st.rerun()
-
-    # --- VISTA GENERAL ---
-    if opcion == "Vista General":
-        st.header("📊 Dashboard de Negocio")
-        prods = obtener_todos_productos()
+    # --- BÚSQUEDA ---
+    if msg.startswith("buscar"):
+        term = msg.replace("buscar", "").strip()
+        if len(term) < 2: return "🔍 Escribe: *buscar camisa*"
         
-        if prods:
-            df = pd.DataFrame(prods)
+        items = buscar_productos_clave(term)
+        if not items: return f"😕 No encontré '{term}'."
+        
+        txt = f"🔍 Resultados para '{term}':\n"
+        imgs = []
+        for i, p in enumerate(items[:5]):
+            txt += f"🔸 {p['nombre']} (${p['precio']}) - ID: {p['id']}\n"
+            if i < 3: imgs.append(p['imagen_url']) # Solo mandamos 3 fotos máx
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("📦 Total Productos", len(df))
-            c2.metric("💰 Valor Inventario", f"${(df['precio']*df['stock']).sum():,.0f}")
-            c3.metric("🏷️ En Oferta", len(df[df['oferta']==True]) if 'oferta' in df else 0)
-            
-            st.divider()
-            
-            col_chart1, col_chart2 = st.columns(2)
-            with col_chart1:
-                st.subheader("Productos por Categoría")
-                if 'categoria' in df.columns:
-                    conteo_cat = df['categoria'].value_counts()
-                    st.bar_chart(conteo_cat)
-                else:
-                    st.info("Sin datos de categoría.")
+        enviar_mensaje(sender_id, txt)
+        for img in imgs: enviar_imagen(sender_id, img)
+        return None
 
-            with col_chart2:
-                st.subheader("Top Stock (Inventario)")
-                if 'stock' in df.columns:
-                    df_stock = df[['nombre', 'stock']].sort_values(by='stock', ascending=False).head(10).set_index('nombre')
-                    st.bar_chart(df_stock)
-            
-            st.divider()
-            
-            st.subheader("📂 Exportar Datos")
-            csv = convertir_df(df)
-            st.download_button("📥 Descargar Inventario (CSV)", csv, "inventario.csv", "text/csv")
+    # --- STOCK POR ID ---
+    if msg.startswith("stock"):
+        import re
+        m = re.search(r'\d+', msg)
+        if not m: return "📦 Escribe: *stock ID*"
+        
+        info = verificar_stock(m.group(0))
+        if not info: return "❌ ID no encontrado."
+        
+        txt = f"📦 *{info['nombre']}*\nStock: {info['stock']} unidades"
+        if not info['disponible']: txt += " (Agotado)"
+        
+        enviar_mensaje(sender_id, txt)
+        enviar_imagen(sender_id, info['imagen_url'])
+        return None
 
-            st.subheader("🖼️ Galería Rápida")
-            cat_filtro = st.multiselect("Filtrar por Categoría", df['categoria'].unique())
-            if cat_filtro:
-                lista_visual = df[df['categoria'].isin(cat_filtro)].to_dict('records')
-            else:
-                lista_visual = prods
+    # --- CARRITO ---
+    if "carrito" in msg and "ver" in msg:
+        c = user_state.get(sender_id, {}).get("carrito", [])
+        if not c: return "🛒 Tu carrito está vacío."
+        
+        txt = "🛒 *Tu Pedido:*\n"
+        total = 0
+        for it in c:
+            sub = it['precio'] * it['cantidad']
+            total += sub
+            txt += f"- {it['cantidad']}x {it['nombre']} (${sub})\n"
+        txt += f"\n💰 Total: ${total}\nEscribe *finalizar* para comprar."
+        return txt
 
-            cols = st.columns(4)
-            for i, row in enumerate(lista_visual):
-                with cols[i % 4]:
-                    with st.container(border=True):
-                        mostrar_imagen_segura(row.get('imagen_url'))
-                        st.markdown(f"**{row.get('nombre')}**")
-                        st.caption(f"{row.get('categoria')} | Stock: {row.get('stock')}")
-                        if row.get('oferta'):
-                            st.markdown(f"🔥 **${row.get('precio')}**")
-                        else:
-                            st.markdown(f"💰 **${row.get('precio')}**")
-
-        else: st.info("Cargando datos...")
-
-    # --- AGREGAR ---
-    elif opcion == "Agregar Producto":
-        st.header("➕ Nuevo Producto")
-        with st.form("add"):
-            c1, c2 = st.columns(2)
-            nombre = c1.text_input("Nombre")
-            precio = c1.number_input("Precio", min_value=0.0)
-            stock = c2.number_input("Stock", min_value=0)
-            cat = c2.selectbox("Categoría", ["Ropa", "Calzado", "Accesorios", "Tecnología", "Hogar", "Deportes", "Otros"])
-            url = st.text_input("Imagen URL")
-            st.caption("Tip: Usa 'Copy Image Address' en Google o sube tu foto a imgur.com")
-            
-            if st.form_submit_button("Guardar"):
-                guardar_producto({"nombre": nombre, "precio": precio, "stock": stock, "categoria": cat, "imagen_url": url, "oferta": False})
-                st.success("Guardado")
-                st.rerun()
-
-    # --- EDITAR ---
-    elif opcion == "Editar / Borrar":
-        st.header("✏️ Editar Producto")
-        prods = obtener_todos_productos()
-        if prods:
-            sel = st.selectbox("Producto:", [f"{p['nombre']} ({p['id_firebase']})" for p in prods])
-            idx = [f"{p['nombre']} ({p['id_firebase']})" for p in prods].index(sel)
-            p = prods[idx]
-            
-            col_form, col_prev = st.columns([2,1])
-            with col_form:
-                with st.form("edit"):
-                    nom = st.text_input("Nombre", p.get('nombre'))
-                    c1, c2 = st.columns(2)
-                    pre = c1.number_input("Precio", value=float(p.get('precio', 0)))
-                    sto = c2.number_input("Stock", value=int(p.get('stock', 0)))
-                    cat_ed = c2.text_input("Categoría", value=p.get('categoria', ''))
-                    img = st.text_input("Imagen URL", p.get('imagen_url', ''))
-                    
-                    if st.form_submit_button("Actualizar"):
-                        p.update({"nombre": nom, "precio": pre, "stock": sto, "categoria": cat_ed, "imagen_url": img})
-                        guardar_producto(p, p['id_firebase'])
-                        st.success("Listo")
-                        st.rerun()
-            with col_prev:
-                st.write("Vista Previa:")
-                mostrar_imagen_segura(p.get('imagen_url'))
-                st.error("Zona de Peligro")
-                if st.button("🗑️ Borrar Producto"):
-                    eliminar_producto(p['id_firebase'])
-                    st.warning("Eliminado")
-                    st.rerun()
-
-    # --- USUARIOS ---
-    elif opcion == "Usuarios":
-        st.header("👥 Clientes")
-        users = obtener_usuarios()
-        if users:
-            df_users = pd.DataFrame(users)
-            st.dataframe(df_users, use_container_width=True)
-            
-            st.download_button("📥 Descargar Clientes CSV", convertir_df(df_users), "clientes.csv", "text/csv")
-            
-            st.write("---")
-            user_list = [f"{u.get('nombre')} ({u.get('id_firebase')})" for u in users]
-            sel_user = st.selectbox("Editar Usuario:", user_list)
-            if sel_user:
-                idx = user_list.index(sel_user)
-                u = users[idx]
-                with st.form("edit_user"):
-                    new_name = st.text_input("Nombre", u.get('nombre'))
-                    new_addr = st.text_input("Dirección", u.get('Direccion', u.get('direccion', '')))
-                    if st.form_submit_button("Guardar Cambios"):
-                        u['nombre'] = new_name
-                        u['Direccion'] = new_addr
-                        del u['id_firebase']
-                        guardar_usuario(u, users[idx]['id_firebase'])
-                        st.success("Actualizado")
-                        st.rerun()
-                if st.button("🗑️ Eliminar Usuario"):
-                    eliminar_usuario(users[idx]['id_firebase'])
-                    st.rerun()
-        else: st.info("Sin usuarios.")
+    if "vaciar" in msg:
+        if sender_id in user_state: user_state[sender_id]["carrito"] = []
+        return "🗑️ Carrito vaciado."
 
     # --- PEDIDOS ---
-    elif opcion == "Pedidos":
-        st.header("📦 Gestión de Pedidos")
-        orders = obtener_pedidos()
-        if orders:
-            df_orders = pd.DataFrame(orders)
-            
-            estado_filter = st.multiselect("Filtrar por Estado", df_orders['estado'].unique() if 'estado' in df_orders.columns else [])
-            df_view = df_orders[df_orders['estado'].isin(estado_filter)] if estado_filter else df_orders
-            
-            st.dataframe(df_view, use_container_width=True)
-            st.download_button("📥 Descargar Pedidos CSV", convertir_df(df_orders), "pedidos.csv", "text/csv")
+    if "mi pedido" in msg:
+        tel = user_state.get(sender_id, {}).get("telefono")
+        if not tel: return "🔒 Inicia sesión para ver tus pedidos."
+        ped = mi_ultimo_pedido(tel)
+        if not ped: return "No tienes pedidos recientes."
+        return f"🧾 Pedido #{ped['id']}\nEstado: {ped.get('estado')}\nTotal: ${ped.get('total')}"
 
-            st.write("---")
-            st.subheader("🔎 Procesar Pedido")
+    # --- REGISTRO / LOGIN ---
+    if msg in ["registrar", "crear cuenta"]:
+        user_state[sender_id] = {"estado": "reg_nombre"}
+        return "📝 Escribe tu nombre completo:"
+    
+    if estado == "reg_nombre":
+        user_state[sender_id]["nombre"] = msg
+        user_state[sender_id]["estado"] = "reg_tel"
+        return "📱 Escribe tu teléfono (10 dígitos):"
+    
+    if estado == "reg_tel":
+        if not msg.isdigit() or len(msg) != 10: return "❌ Número inválido (solo 10 dígitos)."
+        user_state[sender_id]["telefono"] = msg
+        user_state[sender_id]["estado"] = "reg_dir"
+        return "📍 Escribe tu dirección de entrega:"
+    
+    if estado == "reg_dir":
+        try:
+            db.collection("usuarios").document(user_state[sender_id]["telefono"]).set({
+                "nombre": user_state[sender_id]["nombre"],
+                "telefono": user_state[sender_id]["telefono"],
+                "direccion": msg,
+                "rol": "Cliente",
+                "Fecha_registro": datetime.now().strftime("%d/%m/%y")
+            })
+            user_state[sender_id]["estado"] = "logueado"
+            user_state[sender_id]["direccion"] = msg
+            return "✅ ¡Registro completado! Escribe *catalogo* para ver productos."
+        except: return "❌ Error al guardar datos."
+
+    if msg.startswith("iniciar") or msg == "entrar":
+        user_state[sender_id] = {"estado": "login"}
+        return "🔐 Escribe tu teléfono registrado:"
+    
+    if estado == "login":
+        doc = db.collection("usuarios").document(msg).get()
+        if not doc.exists: return "❌ No encontrado. Escribe *registrar*."
+        d = doc.to_dict()
+        # Recuperar carrito si tenía
+        cart = user_state.get(sender_id, {}).get("carrito", [])
+        user_state[sender_id] = {"estado":"logueado", "nombre":d['nombre'], "telefono":msg, "direccion":d.get('direccion'), "carrito":cart}
+        return f"👋 Bienvenido de nuevo, {d['nombre']}."
+
+    # --- CATÁLOGO ---
+    if "catalogo" in msg:
+        if sender_id not in user_state: user_state[sender_id] = {"estado": "inicio"}
+        cats = set([p.get('categoria', 'Varios') for p in obtener_productos_con_cache().values()])
+        user_state[sender_id]["cats_pend"] = list(cats)
+        return "📂 *Categorías:*\n" + "\n".join([f"- {c}" for c in cats]) + "\n\nEscribe el nombre de una categoría."
+
+    # Si escribe el nombre de una categoría
+    cats_pend = [c.lower() for c in user_state.get(sender_id, {}).get("cats_pend", [])]
+    if msg in cats_pend:
+        # Filtrar productos de esa categoría
+        prods = [p for p in obtener_productos_con_cache().values() if p.get('categoria', '').lower() == msg]
+        
+        user_state[sender_id]["prods_cat"] = prods
+        user_state[sender_id]["idx"] = 0
+        user_state[sender_id]["estado"] = "viendo_cat"
+        
+        if not prods: return "Esta categoría está vacía."
+        
+        p = prods[0]
+        # Generar URL
+        p['imagen_url'] = get_img_url(p)
+        
+        txt = f"🔹 *{p['nombre']}*\n💲 ${p['precio']}\n\nEscribe *si* para agregar al carrito, o *no* para ver el siguiente."
+        
+        enviar_mensaje(sender_id, txt)
+        enviar_imagen(sender_id, p['imagen_url'])
+        return None
+
+    if estado == "viendo_cat":
+        if msg in ["no", "siguiente"]:
+            idx = user_state[sender_id]["idx"] + 1
+            prods = user_state[sender_id]["prods_cat"]
             
-            opts = [f"Pedido {o['id_firebase']} | {o.get('nombre', 'N/A')} | ${o.get('total',0)}" for o in orders]
-            sel = st.selectbox("Seleccionar Pedido:", opts)
+            if idx >= len(prods):
+                user_state[sender_id]["estado"] = "logueado" if user_state[sender_id].get("telefono") else "inicio"
+                return "🏁 Fin de la categoría. Escribe *catalogo* para ver otras."
             
-            if sel:
-                o = orders[opts.index(sel)]
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Cliente", o.get('nombre', 'N/A'))
-                c2.metric("Total", f"${o.get('total',0)}")
-                c3.metric("Teléfono", o.get('telefono', 'N/A'))
-                
-                estado_actual = o.get('estado', 'pendiente')
-                c4.metric("Estado Actual", estado_actual)
-                new_status = c4.selectbox("Cambiar Estado:", ["pendiente", "pagado", "enviado", "entregado", "cancelado"], index=0)
-                
-                if c4.button("💾 Actualizar Estado"):
-                    actualizar_estado_pedido(o['id_firebase'], new_status)
-                    st.success(f"Pedido actualizado a: {new_status}")
-                    st.rerun()
-                
-                st.write("**Productos:**")
-                items = o.get('productos', [])
-                if isinstance(items, list): st.table(pd.DataFrame(items))
-                else: st.json(items)
-                
-                if st.button("🗑️ Eliminar Pedido"):
-                    eliminar_pedido(o['id_firebase'])
-                    st.success("Pedido eliminado")
-                    st.rerun()
-        else: st.info("Sin pedidos.")
-
-    # --- IA (MEJORADA: MÁS TEXTO Y DETALLE) ---
-    elif opcion == "Asistente IA":
-        st.header("🤖 Analista")
-        if "messages" not in st.session_state: st.session_state.messages = []
-        for m in st.session_state.messages:
-            with st.chat_message(m["role"]): st.markdown(m["content"])
+            user_state[sender_id]["idx"] = idx
+            p = prods[idx]
+            p['imagen_url'] = get_img_url(p)
             
-        if p := st.chat_input("Pregunta (ej: 'stock de tenis', 'ventas totales')..."):
-            if "PEGAR_TU_TOKEN" in HF_TOKEN: st.error("Falta Token en código")
-            else:
-                st.session_state.messages.append({"role": "user", "content": p})
-                with st.chat_message("user"): st.markdown(p)
-                with st.spinner("Analizando TODA la base de datos..."):
-                    try:
-                        # 1. Traer TODOS los datos
-                        prods = obtener_todos_productos()
-                        usrs = obtener_usuarios()
-                        ords = obtener_pedidos()
-                        
-                        # 2. Construir Contexto Completo (Full Dump)
-                        txt_prods = "--- INVENTARIO (LISTA COMPLETA) ---\n"
-                        for x in prods:
-                            txt_prods += f"- {x.get('nombre')} (${x.get('precio')}) Stock:{x.get('stock')} ID:{x.get('id_firebase')}\n"
-                        
-                        txt_users = "\n--- CLIENTES REGISTRADOS ---\n"
-                        for x in usrs:
-                            txt_users += f"- {x.get('nombre')} (Tel:{x.get('id_firebase')})\n"
-                            
-                        txt_ords = "\n--- ÚLTIMOS PEDIDOS ---\n"
-                        for x in ords[:30]: 
-                            txt_ords += f"- Pedido {x.get('id_firebase')}: Cliente {x.get('nombre')} | Total: ${x.get('total')} | Estado:{x.get('estado')}\n"
+            txt = f"🔹 *{p['nombre']}*\n💲 ${p['precio']}\n\n¿Lo agregamos?"
+            enviar_mensaje(sender_id, txt)
+            enviar_imagen(sender_id, p['imagen_url'])
+            return None
+        
+        if msg in ["si", "lo quiero", "agregar"]:
+            prods = user_state[sender_id]["prods_cat"]
+            p = prods[user_state[sender_id]["idx"]]
+            
+            cart = user_state[sender_id].setdefault("carrito", [])
+            cart.append({"id": "CATALOGO", "nombre": p['nombre'], "precio": p['precio'], "cantidad": 1})
+            return "🛒 Agregado. Escribe *siguiente* para ver más o *finalizar* para pagar."
 
-                        contexto_total = txt_prods + txt_users + txt_ords
+    # --- AGREGAR POR ID ---
+    if msg.startswith("pedido") or (msg.isdigit() and len(msg) <= 4):
+        import re
+        pid_match = re.search(r'\d+', msg)
+        if pid_match:
+            pid = pid_match.group(0)
+            info = verificar_stock(pid)
+            if info and info['disponible']:
+                cart = user_state.setdefault(sender_id, {}).setdefault("carrito", [])
+                prods = obtener_productos_con_cache()
+                precio = prods[pid]['precio']
+                cart.append({"id": pid, "nombre": info['nombre'], "precio": precio, "cantidad": 1})
+                return f"🛒 {info['nombre']} agregado al carrito."
+            return "❌ ID no válido o producto agotado."
 
-                        client = InferenceClient(token=HF_TOKEN)
-                        
-                        # 🔥 MEJORA: Sistema Autoritario para evitar excusas de la IA
-                        sistema = f"""
-                        [ROL IMPERATIVO] Eres el sistema central de análisis de Frere's Collection.
-                        
-                        [DATOS DISPONIBLES]
-                        Abajo tienes el DUMP COMPLETO de la base de datos (Inventario, Clientes, Pedidos).
-                        {contexto_total}
-                        
-                        [REGLAS INQUEBRANTABLES]
-                        1. NO digas que te falta información. Tienes la lista completa arriba.
-                        2. Responde de forma detallada y extensa si es necesario. NO te limites.
-                        3. Si preguntan "ventas totales", SUMA los totales de los pedidos.
-                        4. Usa formato Markdown (negritas, listas) para que se vea profesional.
-                        """
+    # --- FINALIZAR PEDIDO ---
+    if "finalizar" in msg or "comprar" in msg:
+        cart = user_state.get(sender_id, {}).get("carrito")
+        if not cart: return "🛒 Tu carrito está vacío."
+        
+        # VALIDACIÓN: Obligatorio estar logueado
+        if not user_state.get(sender_id, {}).get("telefono"):
+            return "🛑 ¡Espera! Para procesar tu compra necesito saber quién eres.\n\nEscribe *registrar* (si eres nuevo) o *iniciar sesion*."
+        
+        total = sum([i['precio'] * i['cantidad'] for i in cart])
+        
+        pedido = {
+            "telefono": user_state[sender_id]["telefono"],
+            "nombre": user_state[sender_id]["nombre"],
+            "fecha": datetime.now(),
+            "estado": "pendiente",
+            "productos": cart,
+            "total": total,
+            "entrega": "pendiente"
+        }
+        ref = db.collection("pedidos").add(pedido)
+        
+        # Reducir stock
+        for item in cart:
+            if item['id'] != "CATALOGO": reducir_stock(item['id'], item['cantidad'])
+            
+        registrar_conversion(sender_id, ref[1].id, total)
+        user_state[sender_id]["carrito"] = []
+        return f"✅ ¡Pedido #{ref[1].id} Recibido!\nTotal a pagar: ${total}\nNos pondremos en contacto contigo."
 
-                        resp = client.chat_completion(
-                            messages=[
-                                {"role":"system","content":sistema}, 
-                                {"role":"user","content":p}
-                            ],
-                            model="Qwen/Qwen2.5-7B-Instruct", 
-                            max_tokens=2000, # ✅ AUMENTADO: 2000 tokens para respuestas largas
-                            temperature=0.3
-                        )
-                        rta = resp.choices[0].message.content
-                        st.session_state.messages.append({"role": "assistant", "content": rta})
-                        with st.chat_message("assistant"): st.markdown(rta)
-                    except Exception as e: st.error(str(e))
+    # --- IA POR DEFECTO ---
+    return consultar_ia(sender_id, msg)
 
 # ==========================================
-# 5. AUTO-ARRANQUE
+# 6. ENDPOINTS FLASK
 # ==========================================
+@app.route("/webhook", methods=["GET"])
+def verify():
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN: return request.args.get("hub.challenge")
+    return "Error de validación", 403
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if data.get("object") == "page":
+        for entry in data.get("entry", []):
+            for event in entry.get("messaging", []):
+                if "message" in event and not event["message"].get("is_echo"):
+                    sender_id = event["sender"]["id"]
+                    text = event["message"].get("text", "")
+                    
+                    if verificar_rate_limit(sender_id):
+                        text = sanitizar_input(text)
+                        msg_norm = normalizar(text)
+                        
+                        # Restaurar sesión si existe
+                        if sender_id not in user_state:
+                            s = cargar_sesion(sender_id)
+                            if s: user_state[sender_id] = s
+                        
+                        resp = manejar_mensaje(sender_id, msg_norm)
+                        if resp:
+                            enviar_mensaje(sender_id, resp)
+                        
+                        guardar_sesion(sender_id)
+    return "OK", 200
+
 if __name__ == "__main__":
-    try:
-        from streamlit.web import cli as stcli
-    except ImportError:
-        try: from streamlit import cli as stcli
-        except: pass
-    sys.argv = ["streamlit", "run", sys.argv[0]]
-    try: stcli.main()
-    except: pass
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
