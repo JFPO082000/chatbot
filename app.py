@@ -5,6 +5,7 @@ import os
 import unicodedata
 import string
 import urllib.parse
+from urllib.parse import urlparse, parse_qs # Importaciones para limpieza de URL
 from datetime import datetime, timedelta
 
 # Librería para la IA
@@ -66,16 +67,55 @@ def sanitizar_input(texto):
     if not texto: return ""
     return texto[:500].replace('<', '').replace('>', '').strip()
 
-# --- GENERADOR DE IMÁGENES AUTOMÁTICO ---
+# --- VALIDACIÓN Y LIMPIEZA DE IMÁGENES (NUEVO) ---
+
+def clean_google_url(url):
+    """Extrae la URL real si viene de una redirección de Google."""
+    if not url: return ""
+    clean = url.strip()
+    if "google." in clean and "imgurl=" in clean:
+        try:
+            parsed = urlparse(clean)
+            query_params = parse_qs(parsed.query)
+            if 'imgurl' in query_params:
+                return query_params['imgurl'][0]
+        except: pass
+    return clean
+
+def is_valid_image_url(url, timeout=2):
+    """Verifica si la imagen existe (Status 200) rápidamente."""
+    if not url: return False
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; Bot/1.0)'}
+        # HEAD request es más rápido que descargar toda la imagen
+        r = requests.head(url, headers=headers, allow_redirects=True, timeout=timeout)
+        return r.status_code == 200 and 'image' in r.headers.get('Content-Type', '')
+    except:
+        return False
+
 def get_img_url(datos):
-    """Devuelve la URL de Firebase o genera una si no existe."""
-    url = datos.get("imagen_url", "")
-    # Si es un link real (http...), lo usamos
-    if url and url.startswith("http") and len(url) > 10:
-        return url
+    """
+    1. Obtiene URL cruda.
+    2. La limpia (Google fix).
+    3. Verifica si funciona.
+    4. Si falla, usa Placeholder con nombre del producto.
+    """
+    raw_url = datos.get("imagen_url", "")
+    nombre_producto = datos.get("nombre", "Producto")
     
-    # Si no, generamos una imagen con el nombre
-    nombre_safe = urllib.parse.quote_plus(datos.get("nombre", "Producto"))
+    # Paso 1: Limpieza
+    clean_url = clean_google_url(raw_url)
+    
+    # Paso 2: Verificación (Solo si parece un link real http...)
+    if clean_url and clean_url.startswith("http") and len(clean_url) > 10:
+        # Verificamos si es accesible
+        if is_valid_image_url(clean_url):
+            return clean_url
+        else:
+            print(f"⚠️ Imagen rota detectada para: {nombre_producto}")
+
+    # Paso 3: Fallback (Generador de imagen con texto)
+    nombre_safe = urllib.parse.quote_plus(nombre_producto)
     return f"https://placehold.co/300x300?text={nombre_safe}"
 
 # ==========================================
@@ -168,7 +208,7 @@ def buscar_productos_clave(termino):
         # Búsqueda flexible
         if t in nombre or t in cat:
             d['id'] = pid
-            d['imagen_url'] = get_img_url(d) # Aseguramos imagen
+            d['imagen_url'] = get_img_url(d) # AQUI USAMOS LA NUEVA FUNCIÓN
             resultados.append(d)
     return resultados
 
@@ -179,7 +219,7 @@ def verificar_stock(pid):
         return {
             "nombre": d.get("nombre"),
             "stock": d.get("stock", 0),
-            "imagen_url": get_img_url(d),
+            "imagen_url": get_img_url(d), # AQUI USAMOS LA NUEVA FUNCIÓN
             "disponible": int(d.get("stock", 0)) > 0
         }
     return None
@@ -187,7 +227,7 @@ def verificar_stock(pid):
 def mi_ultimo_pedido(telefono):
     try:
         docs = db.collection("pedidos").where("telefono", "==", telefono)\
-                 .order_by("fecha", direction=firestore.Query.DESCENDING).limit(1).stream()
+                  .order_by("fecha", direction=firestore.Query.DESCENDING).limit(1).stream()
         for d in docs:
             ped = d.to_dict()
             ped['id'] = d.id
@@ -268,7 +308,7 @@ def manejar_mensaje(sender_id, msg):
         for pid, d in prods.items():
             if (es_oferta and d.get('oferta')) or (not es_oferta):
                 d['id'] = pid
-                d['imagen_url'] = get_img_url(d)
+                d['imagen_url'] = get_img_url(d) # Validación Automática
                 items.append(d)
             if len(items) >= 5: break
         
