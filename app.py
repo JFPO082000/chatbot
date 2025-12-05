@@ -450,7 +450,11 @@ def manejar_mensaje(sender_id, msg):
     
     if cat_match:
         cat_real_name = all_cats_map[cat_match]
-        prods = [p for pid, p in prods_cache.items() if normalizar(p.get('categoria', '')) == cat_match]
+        prods = []
+        for pid, p in prods_cache.items():
+            if normalizar(p.get('categoria', '')) == cat_match:
+                p['id'] = pid
+                prods.append(p)
         
         if not prods: return f"La categoría '{cat_real_name}' está vacía."
 
