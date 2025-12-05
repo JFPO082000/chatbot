@@ -191,6 +191,7 @@ def buscar_productos_clave(termino):
 
 def verificar_stock(pid):
     prods = obtener_productos_con_cache()
+    # Los IDs en Firebase son las claves del diccionario 'prods'
     if pid in prods:
         d = prods[pid]
         return {
@@ -204,7 +205,7 @@ def verificar_stock(pid):
 def mi_ultimo_pedido(telefono):
     try:
         docs = db.collection("pedidos").where("telefono", "==", telefono)\
-                  .order_by("fecha", direction=firestore.Query.DESCENDING).limit(1).stream()
+                   .order_by("fecha", direction=firestore.Query.DESCENDING).limit(1).stream()
         for d in docs:
             ped = d.to_dict()
             ped['id'] = d.id
@@ -217,27 +218,41 @@ def consultar_ia(sender_id, mensaje):
         prods = obtener_productos_con_cache()
         palabras = mensaje.lower().split()
         relevantes = []
-        otros = []
-        for pid, p in prods.items():
-            texto_prod = (str(p.get("nombre")) + " " + str(p.get("categoria"))).lower()
-            info = f"- {p.get('nombre')} (ID: {pid}) | ${p.get('precio')} | Stock: {p.get('stock')}"
-            match = any(word in texto_prod for word in palabras if len(word) > 3)
-            if match: relevantes.append(info)
-            else: otros.append(info)
         
-        lista_contexto = relevantes[:15] + otros[:5]
+        # 1. Recuperación: Más detalles del producto para la IA
+        for pid, p in prods.items():
+            texto_prod = (str(p.get("nombre")) + " " + str(p.get("categoria")) + " " + str(p.get("descripcion", ""))).lower()
+            
+            # Incluir descripción si existe, para preguntas más complejas
+            descripcion = p.get("descripcion", "Sin descripción")
+            
+            # Formato de información mejorado para la IA
+            info = (f"- {p.get('nombre')} (ID: {pid}) | Precio: ${p.get('precio')} | Stock: {p.get('stock')} | "
+                    f"Categoría: {p.get('categoria')} | Descripción: {descripcion}")
+            
+            # Condición de relevancia
+            match = any(word in texto_prod for word in palabras if len(word) > 3)
+            
+            if match: 
+                relevantes.append(info)
+
+        # Priorizamos los 10 productos más relevantes
+        lista_contexto = relevantes[:10]
         contexto_str = "\n".join(lista_contexto)
         
         prompt = f"""
-        [DIRECTIVA] Eres 'Frere's Bot', un vendedor experto.
+        [DIRECTIVA] Eres 'Frere's Bot', un vendedor experto, amable y conversacional.
         [IDIOMA] Responde SIEMPRE en ESPAÑOL (MÉXICO). Nunca uses otro idioma.
-        [DATOS] Usa este inventario real:
+        [DATOS] Usa este inventario real para responder preguntas:
         {contexto_str}
-        [REGLAS]
-        - Si preguntan precio/stock, dalo exacto.
-        - Si no encuentras el producto en la lista, di amablemente que no lo tienes.
+        
+        [REGLAS DE AGILIDAD]
+        - Responde a la pregunta de manera directa. No fuerces la lista de comandos si no es necesario.
+        - Si te preguntan por un producto específico (ej. "¿qué es la camisa blanca?"), usa la Descripción del producto para responder.
+        - Si el usuario pregunta por el stock o precio, dalo exacto, seguido de una invitación a usar el comando para comprar (Escribe 'pedido ID').
+        - Si te piden navegar el catálogo o una lista completa, invítales a usar el comando *catalogo* o *buscar [término]*.
+        - Si no encuentras el producto en la lista de DATOS, di amablemente que no lo tienes, pero ofrece *buscar* o *catalogo*.
         - Sé breve y usa emojis.
-        - Para vender: "Escribe 'pedido ID'".
         """
         
         client = InferenceClient(token=HF_TOKEN)
@@ -245,7 +260,7 @@ def consultar_ia(sender_id, mensaje):
             messages=[{"role":"system","content":prompt}, {"role":"user","content":mensaje}],
             model="Qwen/Qwen2.5-7B-Instruct",
             max_tokens=200, 
-            temperature=0.3
+            temperature=0.4 # Aumentamos un poco para respuestas más creativas/conversacionales
         )
         return resp.choices[0].message.content
     except Exception as e:
@@ -267,15 +282,12 @@ def manejar_mensaje(sender_id, msg):
         return "❌ Operación cancelada. ¿En qué puedo ayudarte?"
 
     # --- 1. FLUJOS ACTIVOS (Registro/Login) ---
-    # Procesamos estos PRIMERO para evitar que palabras como "hola" rompan el flujo.
-
     if estado == "reg_nombre":
-        user_state[sender_id]["nombre"] = msg # Guardamos lo que escribió (aunque esté normalizado)
+        user_state[sender_id]["nombre"] = msg
         user_state[sender_id]["estado"] = "reg_tel"
         return "📱 Gracias. Ahora escribe tu teléfono (10 dígitos):"
     
     if estado == "reg_tel":
-        # Verificamos si son dígitos (normalizar ya quitó guiones y espacios)
         if not msg.isdigit() or len(msg) != 10: 
             return "❌ Número inválido. Por favor escribe solo los 10 dígitos (Ej: 5512345678)."
         
@@ -288,22 +300,20 @@ def manejar_mensaje(sender_id, msg):
             tel = user_state[sender_id].get("telefono")
             nombre = user_state[sender_id].get("nombre")
             
-            # Guardamos en Firebase
             db.collection("usuarios").document(tel).set({
                 "nombre": nombre,
                 "telefono": tel,
-                "direccion": msg, # Dirección ingresada
+                "direccion": msg,
                 "rol": "Cliente",
                 "Fecha_registro": datetime.now().strftime("%d/%m/%y")
             })
             
-            # Actualizamos sesión local
             user_state[sender_id]["estado"] = "logueado"
             user_state[sender_id]["direccion"] = msg
             return "✅ ¡Registro completado con éxito!\n\nYa puedes hacer pedidos. Escribe *catalogo* para ver nuestros productos."
         except Exception as e:
             print(f"Error Registro: {e}")
-            user_state[sender_id]["estado"] = "inicio" # Reiniciamos por seguridad
+            user_state[sender_id]["estado"] = "inicio"
             return "❌ Hubo un error al guardar tus datos. Intenta escribir *registrar* nuevamente."
 
     if estado == "login":
@@ -312,10 +322,8 @@ def manejar_mensaje(sender_id, msg):
             return "❌ No encontré ese número. Verifica o escribe *registrar* para crear cuenta."
         
         d = doc.to_dict()
-        # Recuperar carrito si tenía
         cart = user_state.get(sender_id, {}).get("carrito", [])
         
-        # Guardar sesión logueada
         user_state[sender_id] = {
             "estado": "logueado", 
             "nombre": d.get('nombre'), 
@@ -326,10 +334,8 @@ def manejar_mensaje(sender_id, msg):
         return f"👋 ¡Bienvenido de nuevo, {d.get('nombre')}!"
 
     # --- 2. ACTIVADORES DE REGISTRO / LOGIN ---
-    # Si no hay flujo activo, buscamos comandos.
-    
     if "registrar" in msg or "crear cuenta" in msg:
-        user_state[sender_id] = {"estado": "reg_nombre"} # Iniciamos flujo limpio
+        user_state[sender_id] = {"estado": "reg_nombre"}
         return "📝 ¡Bienvenido! Para registrarte, primero escribe tu nombre completo:"
 
     if msg.startswith("iniciar") or "entrar" in msg or "login" in msg:
@@ -337,7 +343,6 @@ def manejar_mensaje(sender_id, msg):
         return "🔐 Por favor, escribe tu número de teléfono registrado:"
 
     # --- 3. COMANDOS GENERALES ---
-
     if any(x in msg for x in ["hola", "inicio", "menu", "buenos dias", "buenas tardes"]):
         return "👋 ¡Hola! Soy Frere's Bot.\n\nEscribe:\n🛍 *Catalogo*\n🔍 *Buscar (producto)*\n🆕 *Novedades*\n📦 *Mi Pedido*\n👤 *Registrar / Entrar*"
 
@@ -360,7 +365,7 @@ def manejar_mensaje(sender_id, msg):
         enviar_mensaje(sender_id, titulo)
 
         for p in items:
-            txt = f"🔹 *{p['nombre']}*\n💲 ${p['precio']}\n🆔 ID: {p['id']}\nStock: {p['stock']}"
+            txt = f"🔹 *{p['nombre']}* (ID: {p['id']})\n💲 ${p['precio']}\nStock: {p['stock']}"
             enviar_mensaje(sender_id, txt)
             enviar_imagen(sender_id, p['imagen_url'])
         return None 
@@ -375,20 +380,28 @@ def manejar_mensaje(sender_id, msg):
         
         enviar_mensaje(sender_id, f"🔍 Resultados para '{term}':")
         for p in items[:3]:
-            txt = f"🔸 *{p['nombre']}*\n💲 ${p['precio']}\n🆔 ID: {p['id']}"
+            txt = f"🔸 *{p['nombre']}* (ID: {p['id']})\n💲 ${p['precio']}"
             enviar_mensaje(sender_id, txt)
             enviar_imagen(sender_id, p['imagen_url'])
             
         if len(items) > 3: enviar_mensaje(sender_id, "ℹ️ Hay más resultados, intenta ser más específico.")
         return None
 
-    # --- STOCK POR ID ---
+    # --- STOCK POR ID (Prioridad Media) ---
     if msg.startswith("stock"):
         import re
         m = re.search(r'\d+', msg)
+        
+        if estado == "viendo_cat":
+            user_state[sender_id]["estado"] = "logueado" if user_state[sender_id].get("telefono") else "inicio"
+            
         if not m: return "📦 Escribe: *stock ID*"
-        info = verificar_stock(m.group(0))
-        if not info: return "❌ ID no encontrado."
+        
+        pid_solicitado = m.group(0) 
+        info = verificar_stock(pid_solicitado)
+        
+        if not info: return "❌ ID no encontrado." 
+        
         txt = f"📦 *{info['nombre']}*\nStock: {info['stock']} unidades"
         if not info['disponible']: txt += " (Agotado)"
         enviar_mensaje(sender_id, txt)
@@ -421,7 +434,7 @@ def manejar_mensaje(sender_id, msg):
         return f"🧾 Pedido #{ped['id']}\nEstado: {ped.get('estado')}\nTotal: ${ped.get('total')}"
 
     # --- CATÁLOGO ---
-    all_cats_map = {} 
+    all_cats_map = {}
     for p in prods_cache.values():
         c_raw = p.get('categoria', 'Varios')
         all_cats_map[normalizar(c_raw)] = c_raw
@@ -447,7 +460,7 @@ def manejar_mensaje(sender_id, msg):
         user_state[sender_id]["estado"] = "viendo_cat"
         
         p = prods[0]
-        txt = f"📂 *Categoría: {cat_real_name}*\n\n🔹 *{p['nombre']}*\n💲 ${p['precio']}\n\nEscribe *si* para agregar al carrito, o *no* para ver el siguiente."
+        txt = f"📂 *Categoría: {cat_real_name}*\n\n🔹 *{p['nombre']}* (ID: {p['id']})\n💲 ${p['precio']}\n\nEscribe *si* para agregar, *no* para ver el siguiente, o *stock {p['id']}* para existencias exactas."
         enviar_mensaje(sender_id, txt)
         enviar_imagen(sender_id, p['imagen_url'])
         return None
@@ -461,7 +474,7 @@ def manejar_mensaje(sender_id, msg):
                 return "🏁 Fin de la categoría. Escribe *catalogo* para ver otras."
             user_state[sender_id]["idx"] = idx
             p = prods[idx]
-            txt = f"🔹 *{p['nombre']}*\n💲 ${p['precio']}\n\n¿Lo agregamos?"
+            txt = f"🔹 *{p['nombre']}* (ID: {p['id']})\n💲 ${p['precio']}\n\n¿Lo agregamos? Puedes usar: *stock {p['id']}*."
             enviar_mensaje(sender_id, txt)
             enviar_imagen(sender_id, p['imagen_url'])
             return None
@@ -470,7 +483,7 @@ def manejar_mensaje(sender_id, msg):
             prods = user_state[sender_id]["prods_cat"]
             p = prods[user_state[sender_id]["idx"]]
             cart = user_state[sender_id].setdefault("carrito", [])
-            cart.append({"id": "CATALOGO", "nombre": p['nombre'], "precio": p['precio'], "cantidad": 1})
+            cart.append({"id": p['id'], "nombre": p['nombre'], "precio": p['precio'], "cantidad": 1})
             return "🛒 Agregado. Escribe *siguiente* para ver más o *finalizar* para pagar."
 
     # --- AGREGAR POR ID ---
