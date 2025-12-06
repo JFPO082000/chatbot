@@ -278,24 +278,67 @@ def manejar_mensaje(sender_id, msg):
 
     # --- 0. COMANDO DE CANCELACIÓN (Prioridad Máxima) ---
     if msg == "cancelar":
-        user_state[sender_id]["estado"] = "inicio"
-        return "❌ Operación cancelada. ¿En qué puedo ayudarte?"
+        carrito_tenia_items = len(user_state.get(sender_id, {}).get("carrito", [])) > 0
+        estado_actual = user_state.get(sender_id, {}).get("estado", "inicio")
+        
+        # Preservar datos del usuario si está logueado
+        telefono = user_state.get(sender_id, {}).get("telefono")
+        nombre = user_state.get(sender_id, {}).get("nombre")
+        direccion = user_state.get(sender_id, {}).get("direccion")
+        
+        if telefono:
+            user_state[sender_id] = {
+                "estado": "logueado",
+                "telefono": telefono,
+                "nombre": nombre,
+                "direccion": direccion,
+                "carrito": []  # Vaciar carrito
+            }
+        else:
+            user_state[sender_id] = {"estado": "inicio", "carrito": []}
+        
+        # Mensaje según contexto
+        if carrito_tenia_items:
+            return "❌ Pedido cancelado y carrito vaciado. ¿En qué más puedo ayudarte?"
+        elif estado_actual in ["reg_nombre", "reg_tel", "reg_dir"]:
+            return "❌ Registro cancelado. ¿En qué puedo ayudarte?"
+        elif estado_actual == "login":
+            return "❌ Inicio de sesión cancelado. ¿En qué puedo ayudarte?"
+        elif estado_actual == "viendo_cat":
+            return "❌ Navegación cancelada. ¿En qué puedo ayudarte?"
+        else:
+            return "❌ Operación cancelada. ¿En qué puedo ayudarte?"
 
     # --- 1. FLUJOS ACTIVOS (Registro/Login) ---
     if estado == "reg_nombre":
+        # Permitir salir del flujo de registro
+        if "entrar" in msg or "login" in msg:
+            user_state[sender_id] = {"estado": "login"}
+            return "🔐 Por favor, escribe tu número de teléfono registrado:"
+        
         user_state[sender_id]["nombre"] = msg
         user_state[sender_id]["estado"] = "reg_tel"
-        return "📱 Gracias. Ahora escribe tu teléfono (10 dígitos):"
+        return "📱 Gracias. Ahora escribe tu teléfono (10 dígitos):\n\n(Escribe *cancelar* en cualquier momento para salir)"
     
     if estado == "reg_tel":
+        # Permitir cambiar a login
+        if "entrar" in msg or "login" in msg:
+            user_state[sender_id] = {"estado": "login"}
+            return "🔐 Por favor, escribe tu número de teléfono registrado:"
+        
         if not msg.isdigit() or len(msg) != 10: 
-            return "❌ Número inválido. Por favor escribe solo los 10 dígitos (Ej: 5512345678)."
+            return "❌ Número inválido. Por favor escribe solo los 10 dígitos (Ej: 5512345678).\n\n(Escribe *cancelar* para salir)"
         
         user_state[sender_id]["telefono"] = msg
         user_state[sender_id]["estado"] = "reg_dir"
         return "📍 ¡Casi listo! Escribe tu dirección de entrega:"
     
     if estado == "reg_dir":
+        # Permitir cambiar a login
+        if "entrar" in msg or "login" in msg:
+            user_state[sender_id] = {"estado": "login"}
+            return "🔐 Por favor, escribe tu número de teléfono registrado:"
+        
         try:
             tel = user_state[sender_id].get("telefono")
             nombre = user_state[sender_id].get("nombre")
@@ -317,6 +360,15 @@ def manejar_mensaje(sender_id, msg):
             return "❌ Hubo un error al guardar tus datos. Intenta escribir *registrar* nuevamente."
 
     if estado == "login":
+        # Permitir salir del flujo de login si el usuario quiere registrarse
+        if "registrar" in msg or "crear cuenta" in msg:
+            user_state[sender_id] = {"estado": "reg_nombre"}
+            return "📝 ¡Bienvenido! Para registrarte, primero escribe tu nombre completo:"
+        
+        # Verificar que el mensaje parece un número de teléfono
+        if not msg.isdigit():
+            return "❌ Por favor escribe tu número de teléfono (10 dígitos) o *registrar* para crear cuenta nueva."
+        
         doc = db.collection("usuarios").document(msg).get()
         if not doc.exists: 
             return "❌ No encontré ese número. Verifica o escribe *registrar* para crear cuenta."
@@ -414,11 +466,30 @@ def manejar_mensaje(sender_id, msg):
         if not c: return "🛒 Tu carrito está vacío."
         txt = "🛒 *Tu Pedido:*\n"
         total = 0
+        items_validos = 0
         for it in c:
-            sub = it['precio'] * it['cantidad']
-            total += sub
-            txt += f"- {it['cantidad']}x {it['nombre']} (${sub})\n"
-        txt += f"\n💰 Total: ${total}\nEscribe *finalizar* para comprar."
+            try:
+                precio = it.get('precio', 0)
+                cantidad = it.get('cantidad', 1)
+                nombre = it.get('nombre', 'Producto desconocido')
+                # Asegurar que son números
+                if isinstance(precio, str):
+                    precio = float(precio.replace('$', '').replace(',', ''))
+                if isinstance(cantidad, str):
+                    cantidad = int(cantidad)
+                sub = precio * cantidad
+                total += sub
+                txt += f"- {cantidad}x {nombre} (${sub:.2f})\n"
+                items_validos += 1
+            except Exception as e:
+                print(f"Error en item del carrito: {e}")
+                continue
+        
+        if items_validos == 0:
+            user_state[sender_id]["carrito"] = []
+            return "🛒 Tu carrito está vacío o tiene productos inválidos."
+        
+        txt += f"\n💰 Total: ${total:.2f}\nEscribe *finalizar* para comprar o *vaciar* para limpiar."
         return txt
 
     if "vaciar" in msg:
@@ -470,25 +541,40 @@ def manejar_mensaje(sender_id, msg):
         return None
 
     if estado == "viendo_cat":
+        # Permitir salir del catálogo con comandos comunes
+        if any(x in msg for x in ["catalogo", "menu", "hola", "registrar", "entrar"]):
+            user_state[sender_id]["estado"] = "logueado" if user_state[sender_id].get("telefono") else "inicio"
+            # Re-procesar el mensaje como si fuera nuevo
+            return manejar_mensaje(sender_id, msg)
+        
         if msg in ["no", "siguiente", "otro"]:
-            idx = user_state[sender_id]["idx"] + 1
-            prods = user_state[sender_id]["prods_cat"]
-            if idx >= len(prods):
+            idx = user_state[sender_id].get("idx", 0) + 1
+            prods = user_state[sender_id].get("prods_cat", [])
+            if not prods or idx >= len(prods):
                 user_state[sender_id]["estado"] = "logueado" if user_state[sender_id].get("telefono") else "inicio"
                 return "🏁 Fin de la categoría. Escribe *catalogo* para ver otras."
             user_state[sender_id]["idx"] = idx
             p = prods[idx]
-            txt = f"🔹 *{p['nombre']}* (ID: {p['id']})\n💲 ${p['precio']}\n\n¿Lo agregamos? Puedes usar: *stock {p['id']}*."
+            txt = f"🔹 *{p['nombre']}* (ID: {p['id']})\n💲 ${p['precio']}\n\n¿Lo agregamos? Escribe *salir* para volver al menú."
             enviar_mensaje(sender_id, txt)
             enviar_imagen(sender_id, p['imagen_url'])
             return None
         
         if msg in ["si", "lo quiero", "agregar"]:
-            prods = user_state[sender_id]["prods_cat"]
-            p = prods[user_state[sender_id]["idx"]]
+            prods = user_state[sender_id].get("prods_cat", [])
+            idx = user_state[sender_id].get("idx", 0)
+            if not prods or idx >= len(prods):
+                user_state[sender_id]["estado"] = "inicio"
+                return "❌ Error interno. Escribe *catalogo* para empezar de nuevo."
+            p = prods[idx]
             cart = user_state[sender_id].setdefault("carrito", [])
             cart.append({"id": p['id'], "nombre": p['nombre'], "precio": p['precio'], "cantidad": 1})
             return "🛒 Agregado. Escribe *siguiente* para ver más o *finalizar* para pagar."
+        
+        # Si escribe "salir" o cualquier otra cosa no reconocida en viendo_cat
+        if msg == "salir":
+            user_state[sender_id]["estado"] = "logueado" if user_state[sender_id].get("telefono") else "inicio"
+            return "👋 Saliste del catálogo. ¿En qué más puedo ayudarte?"
 
     # --- AGREGAR POR ID ---
     if msg.startswith("pedido") or (msg.isdigit() and len(msg) <= 4):
@@ -500,7 +586,10 @@ def manejar_mensaje(sender_id, msg):
             if info and info['disponible']:
                 cart = user_state.setdefault(sender_id, {}).setdefault("carrito", [])
                 prods = obtener_productos_con_cache()
-                precio = prods[pid]['precio']
+                # Protección contra KeyError
+                if pid not in prods:
+                    return "❌ Producto no encontrado."
+                precio = prods[pid].get('precio', 0)
                 cart.append({"id": pid, "nombre": info['nombre'], "precio": precio, "cantidad": 1})
                 return f"🛒 {info['nombre']} agregado al carrito."
             return "❌ ID no válido o producto agotado."
@@ -513,22 +602,77 @@ def manejar_mensaje(sender_id, msg):
         if not user_state.get(sender_id, {}).get("telefono"):
             return "🛑 Para procesar tu compra necesito saber quién eres.\n\nEscribe *registrar* (si eres nuevo) o *entrar*."
         
-        total = sum([i['precio'] * i['cantidad'] for i in cart])
-        pedido = {
-            "telefono": user_state[sender_id]["telefono"],
-            "nombre": user_state[sender_id]["nombre"],
-            "fecha": datetime.now(),
-            "estado": "pendiente",
-            "productos": cart,
-            "total": total,
-            "entrega": "pendiente"
-        }
-        ref = db.collection("pedidos").add(pedido)
-        for item in cart:
-            if item['id'] != "CATALOGO": reducir_stock(item['id'], item['cantidad'])
-        registrar_conversion(sender_id, ref[1].id, total)
-        user_state[sender_id]["carrito"] = []
-        return f"✅ ¡Pedido #{ref[1].id} Recibido!\nTotal: ${total}\nNos pondremos en contacto contigo."
+        try:
+            # Validar que todos los items del carrito tengan datos correctos
+            items_validos = []
+            items_sin_stock = []
+            
+            for item in cart:
+                # Verificar que el item tiene los campos necesarios
+                if not item.get('id') or not item.get('nombre'):
+                    continue
+                
+                # Verificar stock actual antes de procesar
+                info_stock = verificar_stock(item['id'])
+                cantidad = item.get('cantidad', 1)
+                
+                if not info_stock or not info_stock.get('disponible'):
+                    items_sin_stock.append(item['nombre'])
+                elif int(info_stock.get('stock', 0)) < cantidad:
+                    items_sin_stock.append(f"{item['nombre']} (solo hay {info_stock['stock']})")
+                else:
+                    # Asegurar que precio es numérico
+                    precio = item.get('precio', 0)
+                    if isinstance(precio, str):
+                        try:
+                            precio = float(precio.replace('$', '').replace(',', ''))
+                        except:
+                            precio = 0
+                    item['precio'] = precio
+                    items_validos.append(item)
+            
+            # Si hay productos sin stock, notificar
+            if items_sin_stock:
+                return f"⚠️ Algunos productos no tienen stock suficiente:\n- " + "\n- ".join(items_sin_stock) + "\n\nEscríbeme para buscar alternativas."
+            
+            if not items_validos:
+                user_state[sender_id]["carrito"] = []
+                return "❌ Tu carrito no tiene productos válidos. Escribe *catalogo* para agregar productos."
+            
+            total = sum([i['precio'] * i.get('cantidad', 1) for i in items_validos])
+            
+            # Verificar que tenemos todos los datos del usuario
+            telefono = user_state[sender_id].get("telefono")
+            nombre = user_state[sender_id].get("nombre", "Sin nombre")
+            direccion = user_state[sender_id].get("direccion", "Sin dirección")
+            
+            pedido = {
+                "telefono": telefono,
+                "nombre": nombre,
+                "direccion": direccion,
+                "fecha": datetime.now(),
+                "estado": "pendiente",
+                "productos": items_validos,
+                "total": total,
+                "entrega": "pendiente"
+            }
+            
+            # Intentar guardar el pedido
+            ref = db.collection("pedidos").add(pedido)
+            
+            # Reducir stock solo después de guardar el pedido exitosamente
+            for item in items_validos:
+                if item['id'] != "CATALOGO": 
+                    if not reducir_stock(item['id'], item.get('cantidad', 1)):
+                        print(f"⚠️ Error reduciendo stock de {item['id']}")
+            
+            registrar_conversion(sender_id, ref[1].id, total)
+            user_state[sender_id]["carrito"] = []
+            return f"✅ ¡Pedido #{ref[1].id} Recibido!\nTotal: ${total}\n📍 Enviaremos a: {direccion}\nNos pondremos en contacto contigo."
+        
+        except Exception as e:
+            print(f"Error al crear pedido: {e}")
+            return "❌ Hubo un error al procesar tu pedido. Por favor intenta de nuevo o escribe *contacto* para ayuda."
 
     # --- IA POR DEFECTO ---
     return consultar_ia(sender_id, msg)
